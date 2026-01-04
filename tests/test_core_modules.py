@@ -129,6 +129,33 @@ class TestControlStack(unittest.TestCase):
         # Verify steering is negative (turning right)
         self.assertLess(u_opt[1], -0.01, 
                         f"MPC Failed to steer right when offset left. Steering: {u_opt[1]}")
+        
+    def test_mpc_obstacle_avoidance(self):
+        """
+        Test if MPC modifies trajectory to avoid an obstacle on the path.
+        """
+        # 1. Reference: Straight line collision course
+        ref_traj = np.zeros((11, 4))
+        for k in range(11):
+            ref_traj[k, 0] = k * 1.0  # x = 0, 1, 2...
+            ref_traj[k, 1] = 0.0      # y = 0
+            ref_traj[k, 2] = 5.0      # v = 5
+        
+        # 2. Obstacle: Placed directly at x=5, y=0
+        # The reference path goes STRAIGHT THROUGH it.
+        # MPC must deviate y to avoid it.
+        obstacles = [(5.0, 0.0, 1.0)] # x, y, radius
+        
+        # 3. Solve
+        x0 = np.array([0.0, 0.0, 5.0, 0.0])
+        u_opt = self.mpc.solve(x0, ref_traj, obstacles)
+        
+        # 4. Check Behavior
+        # To avoid (5,0), the car must steer (u[1] != 0) immediately or soon.
+        # It shouldn't just drive straight (steer ~ 0).
+        print(f"Obstacle Avoidance Steering: {u_opt[1]}")
+        self.assertNotAlmostEqual(u_opt[1], 0.0, places=2, 
+                                  msg="MPC ignored obstacle and drove straight!")
 
 
 if __name__ == '__main__':

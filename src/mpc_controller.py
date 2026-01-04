@@ -3,66 +3,98 @@ import numpy as np
 
 class LinearMPCController:
     """
-    Layer 2: The Safety Filter.
-    Solves a Convex QP to track the Generative Reference while avoiding collisions.
+    Layer 2: The Safety Filter (Updated with Collision Avoidance).
+    Solves a Convex QP to track the Generative Reference while enforcing:
+    1. Kinematics (Linearized)
+    2. Actuator Limits
+    3. Collision Avoidance (Linear Separating Hyperplanes)
     """
     def __init__(self, 
                  horizon=20, 
                  dt=0.1, 
                  wheelbase=2.5,
-                 Q_diag=[10, 10, 5, 1],   # Weights for [x, y, v, yaw]
-                 R_diag=[1, 10]):         # Weights for [accel, steer]
+                 Q_diag=[10, 10, 5, 1],   
+                 R_diag=[1, 10],
+                 safe_distance=2.0):      # Min distance (Ego Radius + Obs Radius)
         self.N = horizon
         self.dt = dt
         self.L = wheelbase
+        self.safe_dist = safe_distance
         
-        # Cost Matrices
+        # Diagonal Cost Matrices
         self.Q = np.diag(Q_diag)
         self.R = np.diag(R_diag)
         
-        # Actuator Limits (Hard Constraints)
-        self.acc_max = 3.0   # m/s^2
+        # Hard Constraints
+        self.acc_max = 3.0   
         self.steer_max = np.deg2rad(35)
-        self.jerk_max = 2.0  # m/s^3 (Reviewer 2's Comfort Metric)
+        self.jerk_max = 2.0 
 
     def get_linearized_dynamics(self, v_ref, phi_ref):
-        """
-        Linearizes Kinematic Bicycle Model around reference velocity/yaw.
-        State: [x, y, v, phi]
-        Input: [a, delta]
-        """
+        """Linearizes Kinematic Bicycle Model around reference."""
         dt = self.dt
         L = self.L
         
-        # Jacobian w.r.t State (A matrix)
-        # x_next = x + v*cos(phi)*dt
-        # y_next = y + v*sin(phi)*dt
-        # v_next = v + a*dt
-        # phi_next = phi + (v/L)*tan(delta)*dt
-        
         A = np.eye(4)
-        A[0, 2] = np.cos(phi_ref) * dt  # d(x)/dv
-        A[0, 3] = -v_ref * np.sin(phi_ref) * dt # d(x)/dphi
-        A[1, 2] = np.sin(phi_ref) * dt  # d(y)/dv
-        A[1, 3] = v_ref * np.cos(phi_ref) * dt # d(y)/dphi
-        A[3, 2] = (np.tan(0.0) / L) * dt # Approximation for small steer angle
+        A[0, 2] = np.cos(phi_ref) * dt  
+        A[0, 3] = -v_ref * np.sin(phi_ref) * dt
+        A[1, 2] = np.sin(phi_ref) * dt  
+        A[1, 3] = v_ref * np.cos(phi_ref) * dt
+        A[3, 2] = (np.tan(0.0) / L) * dt 
         
-        # Jacobian w.r.t Input (B matrix)
         B = np.zeros((4, 2))
-        B[2, 0] = dt # d(v)/da
-        B[3, 1] = (v_ref / L) * dt # d(phi)/ddelta (approx cos^2(delta) ~ 1)
+        B[2, 0] = dt 
+        B[3, 1] = (v_ref / L) * dt 
         
         return A, B
 
-    def solve(self, current_state, reference_traj):
+    def get_separating_hyperplane(self, x_ref, y_ref, obs_x, obs_y):
+        """
+        Computes the linear constraint A_obs * [x, y] <= b_obs.
+        Includes a 'Lookahead Nudge' to break symmetry for obstacles directly ahead.
+        """
+        dx = x_ref - obs_x
+        dy = y_ref - obs_y
+        dist = np.sqrt(dx**2 + dy**2)
+
+        # --- ROBUSTNESS FIX ---
+        # If obstacle is roughly ahead (dist > 0) but we are perfectly aligned (dy ~ 0),
+        # the solver sees a flat wall and will just brake.
+        # We artificially shift 'dy' to simulate the reference being slightly to the side.
+        # This angles the constraint hyperplane, encouraging a swerve.
+        
+        if dist > 0.1 and abs(dy) < 0.5: 
+            # Force a "Right Swerve" bias
+            # We pretend the reference path is actually 2.0m to the right
+            dy = -2.0 
+            # Re-calculate distance and normal with this bias
+            dist = np.sqrt(dx**2 + dy**2)
+        
+        # Handle the "Inside Obstacle" singularity (dist ~ 0)
+        elif dist <= 0.1:
+            dx = 1.0
+            dy = -1.0 # Push right
+            dist = np.sqrt(dx**2 + dy**2)
+        # ----------------------
+
+        # Normalize
+        nx = dx / dist
+        ny = dy / dist
+        
+        # Constraint form: -n_x * x - n_y * y <= - (safe_dist + n_x*obs_x + n_y*obs_y)
+        A_row = np.array([-nx, -ny, 0, 0]) 
+        b_scalar = -(self.safe_dist + nx * obs_x + ny * obs_y)
+        
+        return A_row, b_scalar
+
+    def solve(self, current_state, reference_traj, obstacles=[]):
         """
         Args:
             current_state: [4] (x, y, v, phi)
-            reference_traj: [N+1, 4] (Output from Flow Matching)
-        Returns:
-            optimal_control: [2] (accel, steer)
+            reference_traj: [N+1, 4] Output from Flow Matching
+            obstacles: List of tuples [(x, y, radius), ...]
         """
-        # Variables to optimize
+        # Optimization Variables
         x = cp.Variable((4, self.N + 1))
         u = cp.Variable((2, self.N))
         
@@ -72,31 +104,36 @@ class LinearMPCController:
         # Initial Condition
         constraints += [x[:, 0] == current_state]
         
-        # Iterate over horizon
         for k in range(self.N):
-            # 1. Linearize Dynamics around the Reference at step k
-            # Note: A true LTV-MPC would update A, B at every step based on ref
-            v_k_ref = reference_traj[k, 2]
-            phi_k_ref = reference_traj[k, 3]
-            A_lin, B_lin = self.get_linearized_dynamics(v_k_ref, phi_k_ref)
-            
-            # 2. Dynamics Constraint (Linearized)
-            # x_{k+1} = A x_k + B u_k
+            # 1. Dynamics
+            v_ref = reference_traj[k, 2]
+            phi_ref = reference_traj[k, 3]
+            A_lin, B_lin = self.get_linearized_dynamics(v_ref, phi_ref)
             constraints += [x[:, k+1] == A_lin @ x[:, k] + B_lin @ u[:, k]]
             
-            # 3. Cost Function (Tracking Error + Control Effort)
-            # Minimize: (x - x_ref)^T Q (x - x_ref)
+            # 2. Cost (Tracking + Effort)
             state_error = x[:, k] - reference_traj[k, :]
             cost += cp.quad_form(state_error, self.Q)
-            
-            # Minimize: u^T R u
             cost += cp.quad_form(u[:, k], self.R)
             
-            # 4. Actuator Constraints
+            # 3. Actuator Limits
             constraints += [cp.abs(u[0, k]) <= self.acc_max]
             constraints += [cp.abs(u[1, k]) <= self.steer_max]
             
-            # 5. Jerk Constraint (Slew Rate on Acceleration)
+            # 4. Collision Avoidance (NEW Logic)
+            x_ref_k = reference_traj[k, 0]
+            y_ref_k = reference_traj[k, 1]
+            
+            for obs in obstacles:
+                obs_x, obs_y, obs_r = obs
+                
+                # Compute hyperplane separating reference from obstacle
+                A_obs, b_obs = self.get_separating_hyperplane(x_ref_k, y_ref_k, obs_x, obs_y)
+                
+                # Add Linear Inequality: A_obs * x[:, k] <= b_obs
+                constraints += [A_obs @ x[:, k] <= b_obs]
+
+            # 5. Jerk Limits
             if k > 0:
                 jerk = (u[0, k] - u[0, k-1]) / self.dt
                 constraints += [cp.abs(jerk) <= self.jerk_max]
@@ -104,15 +141,15 @@ class LinearMPCController:
         # Solve QP
         prob = cp.Problem(cp.Minimize(cost), constraints)
         
-        # OSQP is robust and fast for embedded control
+        # Use OSQP solver
         try:
             prob.solve(solver=cp.OSQP, warm_start=True)
         except cp.SolverError:
-            return np.array([0.0, 0.0]) # Fail-safe
+            return np.array([0.0, 0.0])
 
+        # Check Status
         if prob.status not in ["optimal", "optimal_inaccurate"]:
-            print(f"MPC Warning: Solver status is {prob.status}")
-            return np.array([0.0, 0.0]) # Emergency stop
+            # If problem is infeasible (collision unavoidable), brake hard
+            return np.array([-self.acc_max, 0.0]) 
 
-        # Return first control action
         return u[:, 0].value
