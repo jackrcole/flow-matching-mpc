@@ -3,8 +3,8 @@ import numpy as np
 
 class LinearMPCController:
     """
-    Layer 2: The Safety Filter.
-    Solves a Convex QP to track the Reference while enforcing limits and collision constraints.
+    Layer 2: The Safety Filter (Robust Soft-Constraint Version).
+    Uses Slack Variables to prevent 'Infeasible' failures during tight maneuvers.
     """
     def __init__(self, 
                  horizon=20, 
@@ -12,18 +12,22 @@ class LinearMPCController:
                  wheelbase=2.5,
                  Q_diag=[10, 10, 5, 1],   
                  R_diag=[1, 10],
-                 safe_distance=2.0):
+                 ego_radius=1.0):       # Explicit Ego Radius
         self.N = horizon
         self.dt = dt
         self.L = wheelbase
-        self.safe_dist = safe_distance
+        self.ego_r = ego_radius
         
         self.Q = np.diag(Q_diag)
         self.R = np.diag(R_diag)
         
+        # Hard Limits
         self.acc_max = 3.0   
         self.steer_max = np.deg2rad(35)
         self.jerk_max = 2.0 
+        
+        # Slack Cost (High penalty for violating safety)
+        self.slack_penalty = 10000.0
 
     def get_linearized_dynamics(self, v_ref, phi_ref):
         dt = self.dt
@@ -42,7 +46,7 @@ class LinearMPCController:
         
         return A, B
 
-    def get_separating_hyperplane(self, x_ref, y_ref, obs_x, obs_y):
+    def get_separating_hyperplane(self, x_ref, y_ref, obs_x, obs_y, safe_dist):
         """
         Computes the linear constraint A_obs * x <= b_obs.
         """
@@ -50,23 +54,32 @@ class LinearMPCController:
         dy = y_ref - obs_y
         dist = np.sqrt(dx**2 + dy**2)
         
-        # Avoid singularity if reference is EXACTLY inside/on obstacle
+        # Avoid singularity
         if dist < 0.01:
-            dx, dy = 1.0, 0.0 # Default to pushing back
+            dx, dy = 1.0, 0.0 
             dist = 1.0
 
         nx = dx / dist
         ny = dy / dist
         
-        # Constraint: -nx*x - ny*y <= -(safe + nx*obs_x + ny*obs_y)
+        # Constraint: -nx*x - ny*y <= -(safe_dist + nx*obs_x + ny*obs_y)
         A_row = np.array([-nx, -ny, 0, 0]) 
-        b_scalar = -(self.safe_dist + nx * obs_x + ny * obs_y)
+        b_scalar = -(safe_dist + nx * obs_x + ny * obs_y)
         
         return A_row, b_scalar
 
     def solve(self, current_state, reference_traj, obstacles=[]):
+        """
+        Solves the MPC problem with Soft Constraints for collisions.
+        """
         x = cp.Variable((4, self.N + 1))
         u = cp.Variable((2, self.N))
+        
+        # Slack variables: One per step per obstacle
+        # We assume max 5 obstacles to keep shape static, or dynamic based on input
+        n_obs = len(obstacles)
+        if n_obs > 0:
+            slacks = cp.Variable((n_obs, self.N), nonneg=True)
         
         cost = 0
         constraints = []
@@ -79,7 +92,7 @@ class LinearMPCController:
             A_lin, B_lin = self.get_linearized_dynamics(v_ref, phi_ref)
             constraints += [x[:, k+1] == A_lin @ x[:, k] + B_lin @ u[:, k]]
             
-            # 2. Cost
+            # 2. Tracking Cost
             state_error = x[:, k] - reference_traj[k, :]
             cost += cp.quad_form(state_error, self.Q)
             cost += cp.quad_form(u[:, k], self.R)
@@ -88,15 +101,21 @@ class LinearMPCController:
             constraints += [cp.abs(u[0, k]) <= self.acc_max]
             constraints += [cp.abs(u[1, k]) <= self.steer_max]
             
-            # 4. Collision Constraints
+            # 4. Collision Constraints (Soft)
             x_ref_k = reference_traj[k, 0]
             y_ref_k = reference_traj[k, 1]
             
-            for obs in obstacles:
+            for i, obs in enumerate(obstacles):
                 obs_x, obs_y, obs_r = obs
-                # Use geometry to define the "Safe Side" of the line
-                A_obs, b_obs = self.get_separating_hyperplane(x_ref_k, y_ref_k, obs_x, obs_y)
-                constraints += [A_obs @ x[:, k] <= b_obs]
+                safe_dist = self.ego_r + obs_r # Dynamic safe distance
+                
+                A_obs, b_obs = self.get_separating_hyperplane(x_ref_k, y_ref_k, obs_x, obs_y, safe_dist)
+                
+                # Soft Constraint: A * x <= b + slack
+                constraints += [A_obs @ x[:, k] <= b_obs + slacks[i, k]]
+                
+                # Penalize slack usage (L1 penalty for sparsity, or L2)
+                cost += self.slack_penalty * slacks[i, k]
 
             # 5. Jerk Limits
             if k > 0:
@@ -106,11 +125,13 @@ class LinearMPCController:
         prob = cp.Problem(cp.Minimize(cost), constraints)
         
         try:
+            # OSQP is robust
             prob.solve(solver=cp.OSQP, warm_start=True)
         except cp.SolverError:
             return np.array([0.0, 0.0])
 
         if prob.status not in ["optimal", "optimal_inaccurate"]:
+            # If still fails, we are in deep trouble, but Soft Constraints prevent this 99% of time
             return np.array([-self.acc_max, 0.0]) 
 
         return u[:, 0].value
