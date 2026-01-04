@@ -23,7 +23,7 @@ class FlowMatchingActionExpert(nn.Module):
     """
     The 'Action Expert' network v_theta.
     Predicts the vector field (velocity) to transport noise -> expert trajectory.
-    Ref: Alpamayo-R1, Section 5.1 
+    Ref: Alpamayo-R1, Section 5.1
     """
     def __init__(self, 
                  state_dim=4,       # [x, y, v, yaw]
@@ -39,25 +39,22 @@ class FlowMatchingActionExpert(nn.Module):
         self.time_mlp = nn.Sequential(
             SinusoidalPosEmb(hidden_dim),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.SiLU(),
+            nn.SiLU(),  # Keep SiLU here in the MLP, it is valid as a module
             nn.Linear(hidden_dim, hidden_dim),
         )
         
-        # 2. Transformer Decoder Blocks (The "Reasoning" Core)
-        # We use a Decoder-only architecture where:
-        # - Query = The Noisy Trajectory
-        # - Key/Value = The Scene Context (Map + Obstacles)
+        # 2. Transformer Decoder Blocks
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=hidden_dim, 
             nhead=n_heads, 
             dim_feedforward=hidden_dim * 4,
             dropout=dropout,
             batch_first=True,
-            activation="silu" # Modern activation
+            activation="gelu"  # <--- FIXED: Changed from "silu" to "gelu"
         )
         self.transformer = nn.TransformerDecoder(decoder_layer, num_layers=n_layers)
 
-        # 3. Output Head (Predicts Velocity v)
+        # 3. Output Head
         self.output_head = nn.Sequential(
             nn.LayerNorm(hidden_dim),
             nn.Linear(hidden_dim, state_dim)
@@ -66,31 +63,23 @@ class FlowMatchingActionExpert(nn.Module):
     def forward(self, noisy_traj, timestep, context_emb):
         """
         Args:
-            noisy_traj: [Batch, Horizon, State_Dim] (The 'x' in ODE)
+            noisy_traj: [Batch, Horizon, State_Dim]
             timestep:   [Batch] (Scalar time t in [0, 1])
-            context_emb:[Batch, Context_Len, Context_Dim] (From VectorNet)
+            context_emb:[Batch, Context_Len, Context_Dim]
         """
         B, H, _ = noisy_traj.shape
         
         # A. Project Trajectory to Latent Space
-        # x_h: [Batch, Horizon, Hidden_Dim]
         x_h = self.traj_proj(noisy_traj)
 
         # B. Inject Time Embedding
-        # t_emb: [Batch, Hidden_Dim] -> [Batch, 1, Hidden_Dim]
         t_emb = self.time_mlp(timestep).unsqueeze(1)
-        
-        # Add time info to the trajectory features (Broadcasting)
-        # This tells the network "how much noise" is left.
         x_h = x_h + t_emb
 
         # C. Cross-Attend to Context
-        # Query = Trajectory, Key/Value = Context (Map/Obstacles)
-        # Output: [Batch, Horizon, Hidden_Dim]
         x_h = self.transformer(tgt=x_h, memory=context_emb)
 
         # D. Predict Vector Field (Velocity)
-        # v_pred: [Batch, Horizon, State_Dim]
         v_pred = self.output_head(x_h)
 
         return v_pred
